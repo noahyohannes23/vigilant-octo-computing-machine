@@ -1,0 +1,8 @@
+{
+    "name": "vigilant-octo-computing-machine (OCaml 5.5)",
+    "build": {
+	"dockerfile": "Dockerfile"
+    },
+    "remoteUser": "opam",
+    "postCreateCommand": "opam install . --deps-only --with-test -y && opam exec -- dune build"
+}

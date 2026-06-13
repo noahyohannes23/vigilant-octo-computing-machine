@@ -34,3 +34,8 @@ setup.log
 
 # Local OPAM switch
 _opam/
+
+# Editor backup / autosave / lock files
+*~
+\#*\#
+.\#*
