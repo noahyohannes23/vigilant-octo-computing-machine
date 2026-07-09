@@ -1,0 +1,4 @@
+(library
+ (name micrograd)
+ (inline_tests (flags (-verbose)))
+ (preprocess (pps ppx_inline_test)))

@@ -5,4 +5,5 @@
 (package
  (name vigilant_octo)
  (synopsis "Minimal OCaml project to exercise the devcontainer + Emacs eglot setup")
+ (allow_empty)
  (depends ocaml dune))

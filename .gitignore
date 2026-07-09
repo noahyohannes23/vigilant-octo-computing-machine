@@ -35,6 +35,10 @@ setup.log
 # Local OPAM switch
 _opam/
 
+# Generated computation-graph output (bin/main.exe)
+graph.dot
+graph.svg
+
 # Editor backup / autosave / lock files
 *~
 \#*\#
