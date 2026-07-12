@@ -1,16 +1,24 @@
+(* Micrograd implementation in OCaml *)
+
+(* data types *)
+
 type op = string
 type grad = float ref
 type data = float
 type backward = unit -> unit
 type value0 = Node of data * grad * backward * op * value0 list
 
+(* base datatypes *)
+
 let input_data data = Node (data, ref 0., (fun () -> ()), "", [])
+
+(* operations on values *)
 
 let ( +& ) (Node (d1, g1, _, _, _) as v1) (Node (d2, g2, _, _, _) as v2) =
   let grad = ref 0. in
   let backward () =
-    g1 := 1. *. !grad;
-    g2 := 1. *. !grad;
+    g1 := !g1 +. !grad;
+    g2 := !g2 +. !grad;
     ()
   in
   Node (d1 +. d2, grad, backward, "+", [ v1; v2 ])
@@ -19,8 +27,8 @@ let ( +& ) (Node (d1, g1, _, _, _) as v1) (Node (d2, g2, _, _, _) as v2) =
 let ( *& ) (Node (d1, g1, _, _, _) as v1) (Node (d2, g2, _, _, _) as v2) =
   let grad = ref 0. in
   let backward () =
-    g1 := d2 *. !grad;
-    g2 := d1 *. !grad;
+    g1 := !g1 +. (d2 *. !grad);
+    g2 := !g2 +. (d1 *. !grad);
     ()
   in
   Node (d1 *. d2, grad, backward, "*", [ v1; v2 ])
@@ -30,31 +38,51 @@ let tanh (Node (d, g1, _, _, _) as v) =
   let t = (exp (2. *. d) -. 1.) /. (exp (2. *. d) +. 1.) in
   let grad = ref 0. in
   let backward () =
-    g1 := (1. -. (t ** 2.)) *. !grad;
+    g1 := !g1 +. ((1. -. (t ** 2.)) *. !grad);
     ()
   in
   Node (t, grad, backward, "tanh", [ v ])
 ;;
 
 let neg v = v *& input_data (-1.)
-let ( - ) v1 v2 = v1 +& neg v2
+let ( -& ) v1 v2 = v1 +& neg v2
 
-let ( ** ) (Node (d, g, _, _, _) as v) (x : float) =
+let ( **& ) (Node (d, g, _, _, _) as v) (x : float) =
   let grad = ref 0. in
   let backward () =
-    g := ((x *. d) ** (x -. 1.0)) *. !grad;
+    g := !g +. (x *. (d ** (x -. 1.0)) *. !grad);
     ()
   in
   Node (d ** x, grad, backward, "**", [ v ])
 ;;
 
-let rec backward_pass (Node (_, _, b, _, c)) =
-  b ();
-  List.iter backward_pass c
+(* backward pass *)
+
+(* Run backprop over the whole DAG rooted at [root].
+
+   [build] produces a reverse-topological order (each node before its children):
+   for a DAG, membership in the accumulator doubles as the visited set -- a node
+   lands in it exactly once, and there is no path back to a node to re-enter it.
+   Prepending after folding the children puts every parent ahead of its
+   children, so no final reverse is needed.
+
+   Gradients accumulate (the closures use +=), so we must zero every node first;
+   then we seed the output's grad to 1 and fire each node's [backward] once, in
+   order, guaranteeing a node's grad is final before it feeds its children. *)
+let backward_pass root =
+  let rec build order (Node (_, _, _, _, ch) as n) =
+    if List.memq n order then order else n :: List.fold_left build order ch
+  in
+  let order = build [] root in
+  List.iter (fun (Node (_, g, _, _, _)) -> g := 0.) order;
+  (match root with
+   | Node (_, g, _, _, _) -> g := 1.);
+  List.iter (fun (Node (_, _, b, _, _)) -> b ()) order
 ;;
 
 (* Seed the gradient of a node (typically the output, set to 1. before a
    backward pass). *)
+
 let set_grad (Node (_, g, _, _, _)) v = g := v
 
 (* Emit a Graphviz DOT description of the computation graph rooted at [root].
@@ -111,53 +139,55 @@ let to_dot root =
 type weights = value0 list
 type neuron = weights * value0
 
+(* initialize random module for create neuron function *)
+
+let () = Random.self_init ()
+
+(* neuron functions *)
+
 let create_neuron (n_in : int) : neuron =
-  Random.self_init ();
-  let float_in_range r =
-    let multiplier = if Random.int 1 = 0 then -1 else 1 in
-    float_of_int multiplier *. Random.float r
+  let uv _ =
+    input_data
+    @@ Float.mul (Random.float 1.)
+    @@ float_of_int
+    @@ if Random.int 1 = 0 then -1 else 1
   in
-  let rec range f x =
-    match f x with
-    | None -> []
-    | Some (res, next) -> res :: range f next
-  in
-  let uniform_value x = x |> float_in_range |> input_data in
-  let irange (i : int) = if i > n_in then None else Some (uniform_value 1., i + 1) in
-  range irange 1, uniform_value 1.
+  let ws = List.of_seq @@ Seq.init n_in uv in
+  ws, uv ()
 ;;
 
-type 'a gen_iter_opt = (int * 'a) option
-
-(*
-  bind ((i , x) : (int * 'a)) (f : 'a -> int * 'b) : int * 'b
-
-  value: (int * 'a) -> ('a -> (int * 'b)) -> int * 'b
-
-  think of the api
-
-  takes a function (that takes a number i as an arugment and returns some value) and returns a generated list of that function applied to i=1 to some max value
-  *)
-
-let call_neuron ((weights, bias) : neuron) (inputs : value0 list) : value0 =
+let call_neuron (inputs : value0 list) ((weights, bias) : neuron) : value0 =
   List.fold_left
     (fun sum (w_i, x_i) -> sum +& (w_i *& x_i))
     bias
     (List.combine weights inputs)
 ;;
 
+(* layer functions *)
+
 type layer = neuron list
 
-let create_layer n_in n_out =
-  let rec range f x =
-    match f x with
-    | None -> []
-    | Some (res, next) -> res :: range f next
-  in
-  let irange i = if i > n_out then None else Some (create_neuron n_in, i + 1) in
-  range irange 1
+let create_layer (n_in : int) (n_out : int) : layer =
+  List.of_seq @@ Seq.init n_out (fun _ -> create_neuron n_in)
 ;;
 
-let call_layer inputs = List.map (fun n -> call_neuron n inputs)
+let call_layer (inputs : value0 list) = fun (l : layer) -> List.map (call_neuron inputs) l
 
-(* Figure out how to turn irange and range into more callable/normalized functions via monads / currying*)
+(* helper function that helps iterate on two items instead of one *)
+
+let rec map_2el f l =
+  match l with
+  | [] -> []
+  | [ _ ] -> []
+  | fst :: snd :: tl -> f fst snd :: map_2el f (snd :: tl)
+;;
+
+(* mlp functions *)
+
+type mlp = layer list
+
+let create_mlp (n_in : int) (n_outs : int list) : mlp =
+  map_2el create_layer (n_in :: n_outs)
+;;
+
+let call_mlp (inputs : value0 list) = fun (m : mlp) -> List.fold_left call_layer inputs m
