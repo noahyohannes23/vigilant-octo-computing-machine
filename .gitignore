@@ -39,6 +39,9 @@ _opam/
 graph.dot
 graph.svg
 
+# Local Claude Code settings
+.claude/
+
 # Editor backup / autosave / lock files
 *~
 \#*\#

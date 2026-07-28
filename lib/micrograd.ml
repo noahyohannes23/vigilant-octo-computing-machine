@@ -1,193 +1,251 @@
-(* Micrograd implementation in OCaml *)
+(* Micrograd in OCaml -- a small reverse-mode autodiff engine plus a tiny neural
+   net library, following Karpathy's micrograd.
 
-(* data types *)
+   The engine is purely functional. A [value] is an immutable node in a
+   computation DAG: its data, the op that produced it, and its operands. There
+   are no ref cells and nothing is ever mutated -- so a [value] always denotes a
+   fixed number, and backprop can be run any number of times with no need to
+   "zero" anything first. The backward pass is a fold that *returns* a mapping
+   from node to gradient rather than writing gradients back into the graph. *)
 
-type op = string
-type grad = float ref
-type data = float
-type backward = unit -> unit
-type value0 = Node of data * grad * backward * op * value0 list
+(* ----- values ----- *)
 
-(* base datatypes *)
+type op =
+  | Input
+  | Add
+  | Mul
+  | Tanh
+  | Pow of float
 
-let input_data data = Node (data, ref 0., (fun () -> ()), "", [])
+type value =
+  { data : float
+  ; op : op
+  ; prev : value list
+  }
 
-(* operations on values *)
+let input data = { data; op = Input; prev = [] }
+let ( +& ) a b = { data = a.data +. b.data; op = Add; prev = [ a; b ] }
+let ( *& ) a b = { data = a.data *. b.data; op = Mul; prev = [ a; b ] }
 
-let ( +& ) (Node (d1, g1, _, _, _) as v1) (Node (d2, g2, _, _, _) as v2) =
-  let grad = ref 0. in
-  let backward () =
-    g1 := !g1 +. !grad;
-    g2 := !g2 +. !grad;
-    ()
-  in
-  Node (d1 +. d2, grad, backward, "+", [ v1; v2 ])
+let tanh v =
+  let t = (exp (2. *. v.data) -. 1.) /. (exp (2. *. v.data) +. 1.) in
+  { data = t; op = Tanh; prev = [ v ] }
 ;;
 
-let ( *& ) (Node (d1, g1, _, _, _) as v1) (Node (d2, g2, _, _, _) as v2) =
-  let grad = ref 0. in
-  let backward () =
-    g1 := !g1 +. (d2 *. !grad);
-    g2 := !g2 +. (d1 *. !grad);
-    ()
+let ( **& ) v (x : float) = { data = v.data ** x; op = Pow x; prev = [ v ] }
+let neg v = v *& input (-1.)
+let ( -& ) a b = a +& neg b
+
+(* ----- backward pass ----- *)
+
+(* Reverse-topological order: every node appears before its operands.
+
+   Nodes are deduplicated by *physical* identity ([memq]), not structural
+   equality: this is a shared DAG (one value can feed several ops), so structural
+   comparison would both mis-merge distinct-but-equal nodes and diverge chasing
+   cycles that don't exist in identity terms. Prepending [n] after folding its
+   operands puts every parent ahead of its children, which is exactly the order
+   backprop needs. *)
+let topo root =
+  let rec build order n =
+    if List.memq n order then order else n :: List.fold_left build order n.prev
   in
-  Node (d1 *. d2, grad, backward, "*", [ v1; v2 ])
+  build [] root
 ;;
 
-let tanh (Node (d, g1, _, _, _) as v) =
-  let t = (exp (2. *. d) -. 1.) /. (exp (2. *. d) +. 1.) in
-  let grad = ref 0. in
-  let backward () =
-    g1 := !g1 +. ((1. -. (t ** 2.)) *. !grad);
-    ()
-  in
-  Node (t, grad, backward, "tanh", [ v ])
+(* A gradient environment: an association list keyed by physical node identity.
+   [add_grad] prepends, so the head binding for a node always holds its running
+   sum and [assq] returns that head. This is what replaces the old grad refs --
+   accumulation lives in a returned value, not in the graph. *)
+type grads = (value * float) list
+
+let grad_of (env : grads) node = Option.value ~default:0. (List.assq_opt node env)
+let add_grad (env : grads) node delta : grads = (node, grad_of env node +. delta) :: env
+
+(* Local partials d(output)/d(operand) for a single node, given the node's own
+   value. On a [Tanh] node [data] is already tanh(x), so d/dx = 1 - data^2. *)
+let local_grads node =
+  match node.op, node.prev with
+  | Input, _ -> []
+  | Add, [ a; b ] -> [ a, 1.; b, 1. ]
+  | Mul, [ a; b ] -> [ a, b.data; b, a.data ]
+  | Tanh, [ x ] -> [ x, 1. -. (node.data ** 2.) ]
+  | Pow e, [ x ] -> [ x, e *. (x.data ** (e -. 1.)) ]
+  | _ -> invalid_arg "local_grads: malformed node"
 ;;
 
-let neg v = v *& input_data (-1.)
-let ( -& ) v1 v2 = v1 +& neg v2
-
-let ( **& ) (Node (d, g, _, _, _) as v) (x : float) =
-  let grad = ref 0. in
-  let backward () =
-    g := !g +. (x *. (d ** (x -. 1.0)) *. !grad);
-    ()
-  in
-  Node (d ** x, grad, backward, "**", [ v ])
-;;
-
-(* backward pass *)
-
-(* Run backprop over the whole DAG rooted at [root].
-
-   [build] produces a reverse-topological order (each node before its children):
-   for a DAG, membership in the accumulator doubles as the visited set -- a node
-   lands in it exactly once, and there is no path back to a node to re-enter it.
-   Prepending after folding the children puts every parent ahead of its
-   children, so no final reverse is needed.
-
-   Gradients accumulate (the closures use +=), so we must zero every node first;
-   then we seed the output's grad to 1 and fire each node's [backward] once, in
-   order, guaranteeing a node's grad is final before it feeds its children. *)
-let backward_pass root =
-  let rec build order (Node (_, _, _, _, ch) as n) =
-    if List.memq n order then order else n :: List.fold_left build order ch
-  in
-  let order = build [] root in
-  List.iter (fun (Node (_, g, _, _, _)) -> g := 0.) order;
-  (match root with
-   | Node (_, g, _, _, _) -> g := 1.);
-  List.iter (fun (Node (_, _, b, _, _)) -> b ()) order
-;;
-
-(* Seed the gradient of a node (typically the output, set to 1. before a
-   backward pass). *)
-
-let set_grad (Node (_, g, _, _, _)) v = g := v
-
-(* Emit a Graphviz DOT description of the computation graph rooted at [root].
-
-   The structure mirrors Karpathy's micrograd: every [Value] is drawn as a
-   record box showing its data and grad, and every operation (+, *, tanh) is a
-   small oval feeding its result box. Edges run from operand boxes into the op.
-
-   Nodes are deduplicated by *physical* identity (== / List.memq), not
-   structural equality: this is a DAG, so a single Value can feed several ops,
-   and structural comparison would both mis-merge distinct nodes and loop
-   forever chasing the [backward] closure. [ids] hands out a stable integer per
-   physical node (assigned lazily, so an edge can reference a child before it is
-   drawn), while [emitted] tracks which boxes have already been written. *)
-let to_dot root =
-  let buf = Buffer.create 256 in
-  let ids : (value0 * int) list ref = ref [] in
-  let next = ref 0 in
-  let id_of n =
-    match List.assq_opt n !ids with
-    | Some i -> i
-    | None ->
-      let i = !next in
-      incr next;
-      ids := (n, i) :: !ids;
-      i
-  in
-  let emitted : value0 list ref = ref [] in
-  let rec go (Node (d, g, _, op, children) as n) =
-    if not (List.memq n !emitted)
-    then (
-      emitted := n :: !emitted;
-      let id = id_of n in
-      Printf.bprintf buf "  n%d [shape=record label=\"data %.4f | grad %.4f\"];\n" id d !g;
-      if op <> ""
-      then (
-        Printf.bprintf buf "  op%d [label=%S];\n" id op;
-        Printf.bprintf buf "  op%d -> n%d;\n" id id);
-      List.iter
-        (fun c ->
-           let cid = id_of c in
-           if op = ""
-           then Printf.bprintf buf "  n%d -> n%d;\n" cid id
-           else Printf.bprintf buf "  n%d -> op%d;\n" cid id)
-        children;
-      List.iter go children)
-  in
-  Buffer.add_string buf "digraph G {\n  rankdir=LR;\n";
-  go root;
-  Buffer.add_string buf "}\n";
-  Buffer.contents buf
-;;
-
-type weights = value0 list
-type neuron = weights * value0
-
-(* initialize random module for create neuron function *)
-
-let () = Random.self_init ()
-
-(* neuron functions *)
-
-let create_neuron (n_in : int) : neuron =
-  let uv _ =
-    input_data
-    @@ Float.mul (Random.float 1.)
-    @@ float_of_int
-    @@ if Random.int 1 = 0 then -1 else 1
-  in
-  let ws = List.of_seq @@ Seq.init n_in uv in
-  ws, uv ()
-;;
-
-let call_neuron (inputs : value0 list) ((weights, bias) : neuron) : value0 =
+(* Backprop from [root]: seed its gradient to 1, then walk parents-before-
+   children, pushing each node's accumulated gradient onto its operands via the
+   chain rule. Because every parent precedes its children in [topo], a node's
+   gradient is final by the time we read it. Returns the full gradient
+   environment; query it with [grad_of]. Nothing in [root] is modified. *)
+let backward root : grads =
   List.fold_left
-    (fun sum (w_i, x_i) -> sum +& (w_i *& x_i))
-    bias
-    (List.combine weights inputs)
+    (fun env node ->
+       let g = grad_of env node in
+       List.fold_left
+         (fun env (child, local) -> add_grad env child (local *. g))
+         env
+         (local_grads node))
+    (add_grad [] root 1.)
+    (topo root)
 ;;
 
-(* layer functions *)
+(* ----- visualization ----- *)
 
+let string_of_op = function
+  | Input -> ""
+  | Add -> "+"
+  | Mul -> "*"
+  | Tanh -> "tanh"
+  | Pow e -> Printf.sprintf "**%g" e
+;;
+
+(* Emit a Graphviz DOT description of the DAG rooted at [root], mirroring
+   Karpathy's diagrams: each value is a record box (data | grad) and each op is a
+   small oval feeding its result box. Pass the [grads] returned by [backward] to
+   annotate the boxes (defaults to 0 when omitted).
+
+   Node identity comes from position in [topo], which is already deduplicated by
+   physical identity -- so a value shared by several ops is drawn once, and this
+   stays purely functional (no id counter, no emitted-set ref). *)
+let to_dot ?(grads = []) root =
+  let order = topo root in
+  let id n =
+    let rec idx i = function
+      | x :: _ when x == n -> i
+      | _ :: tl -> idx (i + 1) tl
+      | [] -> assert false
+    in
+    idx 0 order
+  in
+  let node_lines n =
+    let i = id n in
+    let box =
+      Printf.sprintf
+        "  n%d [shape=record label=\"data %.4f | grad %.4f\"];\n"
+        i
+        n.data
+        (grad_of grads n)
+    in
+    let op_box =
+      match n.op with
+      | Input -> ""
+      | _ ->
+        Printf.sprintf "  op%d [label=%S];\n  op%d -> n%d;\n" i (string_of_op n.op) i i
+    in
+    let edges =
+      List.map
+        (fun c ->
+           match n.op with
+           | Input -> Printf.sprintf "  n%d -> n%d;\n" (id c) i
+           | _ -> Printf.sprintf "  n%d -> op%d;\n" (id c) i)
+        n.prev
+    in
+    box ^ op_box ^ String.concat "" edges
+  in
+  "digraph G {\n  rankdir=LR;\n"
+  ^ String.concat "" (List.map node_lines order)
+  ^ "}\n"
+;;
+
+(* ----- neural net ----- *)
+
+type neuron = value list * value (* weights, bias *)
 type layer = neuron list
-
-let create_layer (n_in : int) (n_out : int) : layer =
-  List.of_seq @@ Seq.init n_out (fun _ -> create_neuron n_in)
-;;
-
-let call_layer (inputs : value0 list) = fun (l : layer) -> List.map (call_neuron inputs) l
-
-(* helper function that helps iterate on two items instead of one *)
-
-let rec map_2el f l =
-  match l with
-  | [] -> []
-  | [ _ ] -> []
-  | fst :: snd :: tl -> f fst snd :: map_2el f (snd :: tl)
-;;
-
-(* mlp functions *)
-
 type mlp = layer list
 
-let create_mlp (n_in : int) (n_outs : int list) : mlp =
-  map_2el create_layer (n_in :: n_outs)
+(* Weights and bias initialized uniformly in (-1, 1). Randomness is the one
+   deliberate effect in this file; seed it from the caller (e.g. [Random.self_init]
+   in [main]) so nothing runs at module-load time. *)
+let create_neuron (n_in : int) : neuron =
+  let random_weight () = input (Random.float 2. -. 1.) in
+  List.of_seq (Seq.init n_in (fun _ -> random_weight ())), random_weight ()
 ;;
 
-let call_mlp (inputs : value0 list) = fun (m : mlp) -> List.fold_left call_layer inputs m
+(* A neuron computes tanh(w . x + b): the nonlinearity is what lets stacked
+   layers represent something a single linear map cannot. *)
+let call_neuron (inputs : value list) ((weights, bias) : neuron) : value =
+  List.fold_left (fun sum (w, x) -> sum +& (w *& x)) bias (List.combine weights inputs)
+  |> tanh
+;;
+
+let create_layer (n_in : int) (n_out : int) : layer =
+  List.of_seq (Seq.init n_out (fun _ -> create_neuron n_in))
+;;
+
+let call_layer (inputs : value list) (l : layer) : value list =
+  List.map (call_neuron inputs) l
+;;
+
+(* Slide a binary function across consecutive pairs: [a; b; c] -> [f a b; f b c].
+   Turns a width list [n_in; h1; ...; n_out] into per-layer (fan-in, fan-out)
+   pairs. *)
+let rec map_2el f l =
+  match l with
+  | fst :: (snd :: _ as rest) -> f fst snd :: map_2el f rest
+  | _ -> []
+;;
+
+let create_mlp (n_in : int) (n_outs : int list) : mlp = map_2el create_layer (n_in :: n_outs)
+let call_mlp (inputs : value list) (m : mlp) : value list = List.fold_left call_layer inputs m
+
+(* ----- parameters ----- *)
+
+let neuron_params ((ws, b) : neuron) : value list = b :: ws
+let layer_params (l : layer) : value list = List.concat_map neuron_params l
+let mlp_params (m : mlp) : value list = List.concat_map layer_params m
+
+(* Rebuild a network, replacing every parameter [p] with [f p]. Purely
+   functional: the input [mlp] is untouched and a fresh one is returned. This is
+   how a gradient step "updates weights" without mutation. *)
+let map_neuron f ((ws, b) : neuron) : neuron = List.map f ws, f b
+let map_layer f (l : layer) : layer = List.map (map_neuron f) l
+let map_mlp f (m : mlp) : mlp = List.map (map_layer f) m
+
+(* ----- training ----- *)
+
+(* Scalar prediction for one input row (assumes a single output unit). *)
+let predict (m : mlp) (xrow : float list) : value =
+  match call_mlp (List.map input xrow) m with
+  | [ o ] -> o
+  | outs ->
+    invalid_arg (Printf.sprintf "predict: expected 1 output, got %d" (List.length outs))
+;;
+
+(* Sum of squared errors over the dataset -- one scalar [value] whose DAG shares
+   the network's parameters across every example, so backprop accumulates each
+   parameter's gradient over the whole batch. *)
+let loss (m : mlp) (xs : float list list) (ys : float list) : value =
+  List.fold_left2
+    (fun acc xrow y ->
+       let diff = predict m xrow -& input y in
+       acc +& (diff **& 2.))
+    (input 0.)
+    xs
+    ys
+;;
+
+(* One gradient-descent step. Returns the current loss and a *new* network with
+   every parameter nudged down its gradient. Pure: [m] is not modified. *)
+let step ~lr (xs : float list list) (ys : float list) (m : mlp) : float * mlp =
+  let l = loss m xs ys in
+  let g = backward l in
+  let m' = map_mlp (fun p -> input (p.data -. (lr *. grad_of g p))) m in
+  l.data, m'
+;;
+
+(* Run [epochs] gradient-descent steps. Returns the trained network and the loss
+   history (oldest first). No I/O -- the caller decides what to print. *)
+let train ~lr ~epochs (xs : float list list) (ys : float list) (m : mlp)
+  : mlp * float list
+  =
+  let rec go k m history =
+    if k = 0
+    then m, List.rev history
+    else (
+      let l, m' = step ~lr xs ys m in
+      go (k - 1) m' (l :: history))
+  in
+  go epochs m []
+;;
